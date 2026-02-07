@@ -1,5 +1,4 @@
 The mod transforms unstructured player actions 
-
 into a clean, machine-readable logistics stream. 
 
 By storing the unit_number (ID) of machines or chests, 
