@@ -2,27 +2,19 @@ The mod transforms unstructured player actions
 into a clean, machine-readable logistics stream. 
 
 By storing the unit_number (ID) of machines or chests, 
-
 the path of each item can be tracked precisely. 
 
 The system is a data source for complex evaluations 
-
 or logistics statistics. 
 
 logistics event: (when, who, what, where, object)
 
 {
-
   tick = 12345,
-  
-  actor = { type = "player-hand", id = 1, name = "PlayerName"},
-  
-  action = "GIVE",
-  
-  source_or_target = { type = "assembling-machine-2", id = 67890, slot_name = "modules"},
-  
-  item = { name = "efficiency-module", quantity = 1, quality = "epic"}
-  
+    actor = { type = "player-hand", id = 1, name = "PlayerName"},
+    action = "GIVE",
+    source_or_target = { type = "assembling-machine-2", id = 67890, slot_name = "modules"},
+    item = { name = "efficiency-module", quantity = 1, quality = "epic"}
 }
 
 
