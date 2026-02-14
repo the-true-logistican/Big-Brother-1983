@@ -16,32 +16,34 @@
 --  item = { name = "efficiency-module", quantity = 1, quality = "epic"}
 -- }
 --
--- Version 0.1.0
+-- Actions: TAKE, GIVE, MAKE
+-- MAKE is used for crafting/production processes
+--
+-- Version 0.1.0 first operational Version
+-- Version 0.1.1 Make intriduced
+-- Version 0.2.0 Material in machines and chests is traced
+--               taking material from the ground (F or left-click) corrected 
 --
 -- ------------------------------------------
 
 local API_NAME = "logistics_events_api"
+
+-- Generate event ID IMMEDIATELY when mod loads (not persistent!)
+-- Event-ID SOFORT beim Mod-Load erzeugen (nicht persistent!)
+local logistics_event_id = script.generate_event_name()
 
 -- Global table to store the state
 -- Globale Tabelle zum Speichern des Zustands
 script.on_init(function()
     storage.player_data = {}
     storage.logistics_events = {}
-
-    -- Generate and store custom event ID once
-    -- Custom-Event-ID einmalig erzeugen und speichern
-    storage.logistics_event_id = script.generate_event_name()
+    game.print("[Big Brother] Initialisiert - Event-ID: " .. tostring(logistics_event_id))
 end)
 
 script.on_configuration_changed(function()
     storage.player_data = storage.player_data or {}
     storage.logistics_events = storage.logistics_events or {}
-
-    -- Update event ID for old saves/upgrades
-    -- Falls alte Saves/Upgrades: Event-ID nachziehen
-    if not storage.logistics_event_id then
-        storage.logistics_event_id = script.generate_event_name()
-    end
+    game.print("[Big Brother] Konfiguration geändert - Event-ID: " .. tostring(logistics_event_id))
 end)
 
 -- Remote API: other mods can query the event ID (and optionally use pull)
@@ -49,7 +51,7 @@ end)
 if not remote.interfaces[API_NAME] then
     remote.add_interface(API_NAME, {
         get_event_id = function()
-            return storage and storage.logistics_event_id or nil
+            return logistics_event_id
         end,
 
         -- Optional: Pull API (if a mod wants to load events later)
@@ -79,8 +81,8 @@ end
 
 -- Helper function: Create a logistics event
 -- Hilfsfunktion: Erstelle ein Logistik-Event
--- action: "TAKE" or "GIVE"
--- action: "TAKE" oder "GIVE"
+-- action: "TAKE", "GIVE", or "MAKE"
+-- action: "TAKE", "GIVE" oder "MAKE"
 -- actor: Table with {type, id, name}
 -- actor: Table mit {type, id, name}
 -- source_or_target: Table with {type, id, slot_name}
@@ -91,7 +93,7 @@ local function create_logistics_event(action, actor, source_or_target, item)
     local event = {
         tick = game.tick,
         actor = actor,                      -- {type = "player-hand", id = 1, name = "PlayerName"}
-        action = action,                    -- "TAKE" or "GIVE" / "TAKE" oder "GIVE"
+        action = action,                    -- "TAKE", "GIVE", or "MAKE" / "TAKE", "GIVE" oder "MAKE"
         source_or_target = source_or_target, -- {type = "assembling-machine-2", id = 12345, slot_name = "modules"}
         item = item                         -- {name = "efficiency-module", quantity = 1, quality = "normal"}
     }
@@ -100,15 +102,15 @@ local function create_logistics_event(action, actor, source_or_target, item)
 
     -- Notify other mods (Push)
     -- Andere Mods benachrichtigen (Push)
-    if storage.logistics_event_id then
-        script.raise_event(storage.logistics_event_id, { logistics_event = event })
-    end
+    script.raise_event(logistics_event_id, { logistics_event = event })
 
     -- Debug output
     -- Ausgabe für Debugging
 --    local location_str = source_or_target.type .. " [ID:" .. source_or_target.id .. "] Slot:" .. source_or_target.slot_name
 --    if action == "TAKE" then
---        game.print("[Big-Brother] TAKE | Tick:" .. event.tick .. " | Actor:" .. actor.type .. "[" .. actor.id .. "," .. actor.name .. "] | Source:" .. location_str .. " | Item:" .. item.name .. " | Qty:" .. item.quantity .. " | Quality:" .. item.quality)
+--       game.print("[Big-Brother] TAKE | Tick:" .. event.tick .. " | Actor:" .. actor.type .. "[" .. actor.id .. "," .. actor.name .. "] | Source:" .. location_str .. " | Item:" .. item.name .. " | Qty:" .. item.quantity .. " | Quality:" .. item.quality)
+--    elseif action == "MAKE" then
+--        game.print("[Big-Brother] MAKE | Tick:" .. event.tick .. " | Actor:" .. actor.type .. "[" .. actor.id .. "," .. actor.name .. "] | Location:" .. location_str .. " | Item:" .. item.name .. " | Qty:" .. item.quantity .. " | Quality:" .. item.quality)
 --    else -- GIVE
 --        game.print("[Big-Brother] GIVE | Tick:" .. event.tick .. " | Actor:" .. actor.type .. "[" .. actor.id .. "," .. actor.name .. "] | Target:" .. location_str .. " | Item:" .. item.name .. " | Qty:" .. item.quantity .. " | Quality:" .. item.quality)
 --    end
@@ -183,6 +185,7 @@ end
 -- Hilfsfunktion: Hole alle Inventare einer Entität mit Bezeichnung
 local function get_all_entity_inventories(entity)
     local inventories = {}
+    local seen_inventories = {}  -- Track inventory objects we've already added
 
     local inventory_types = {
         {type = defines.inventory.chest, slot_name = "chest"},
@@ -206,13 +209,19 @@ local function get_all_entity_inventories(entity)
     for _, inv_data in pairs(inventory_types) do
         local inv = entity.get_inventory(inv_data.type)
         if inv and inv.valid then
-            table.insert(inventories, {
-                inventory = inv,
-                type = inv_data.type,
-                slot_name = inv_data.slot_name,
-                entity_type = entity.type,
-                entity_id = entity.unit_number or 0
-            })
+            -- Use inventory index as unique identifier to avoid duplicates
+            -- Nutze Inventar-Index als eindeutigen Identifier um Duplikate zu vermeiden
+            local inv_index = inv.index
+            if not seen_inventories[inv_index] then
+                seen_inventories[inv_index] = true
+                table.insert(inventories, {
+                    inventory = inv,
+                    type = inv_data.type,
+                    slot_name = inv_data.slot_name,
+                    entity_type = entity.type,
+                    entity_id = entity.unit_number or 0
+                })
+            end
         end
     end
 
@@ -612,4 +621,315 @@ script.on_event(defines.events.on_player_fast_transferred, function(event)
     -- Update player inventory snapshot
     -- Update Spieler-Inventar Snapshot
     pdata.main_inventory = current_player_inv
+end)
+-- Event: Player drops items on ground
+-- Event: Spieler wirft Items auf den Boden
+script.on_event(defines.events.on_player_dropped_item, function(event)
+    local player = game.players[event.player_index]
+    local entity = event.entity -- The dropped item entity on ground
+    
+    if not entity or not entity.valid or not entity.stack or not entity.stack.valid_for_read then return end
+    
+    init_player_data(event.player_index)
+    
+    local actor = {
+        type = "player-hand",
+        id = event.player_index,
+        name = player.name
+    }
+    
+    local item = {
+        name = entity.stack.name,
+        quantity = entity.stack.count,
+        quality = entity.stack.quality and entity.stack.quality.name or "normal"
+    }
+    
+    -- 1. TAKE from player inventory
+    -- 1. TAKE aus Spieler-Inventar
+    local source = {
+        type = "player-inventory",
+        id = event.player_index,
+        slot_name = "main"
+    }
+    create_logistics_event("TAKE", actor, source, item)
+    
+    -- 2. GIVE to world/ground
+    -- 2. GIVE auf den Boden/Welt
+    local target = {
+        type = "ground",
+        id = entity.unit_number or 0,
+        slot_name = "none"
+    }
+    create_logistics_event("GIVE", actor, target, item)
+end)
+
+-- Event: Player picks up items from ground
+-- Event: Spieler hebt Items vom Boden auf
+script.on_event(defines.events.on_picked_up_item, function(event)
+    local player = game.players[event.player_index]
+    local item_stack = event.item_stack
+    
+    if not item_stack or not item_stack.name then return end
+    
+    game.print("[DEBUG] on_picked_up_item: " .. item_stack.name .. " x" .. item_stack.count)
+    
+    init_player_data(event.player_index)
+    
+    local actor = {
+        type = "player-hand",
+        id = event.player_index,
+        name = player.name
+    }
+    
+    local item = {
+        name = item_stack.name,
+        quantity = item_stack.count,
+        quality = item_stack.quality and item_stack.quality.name or "normal"
+    }
+    
+    -- 1. TAKE from ground
+    -- 1. TAKE vom Boden
+    local source = {
+        type = "ground",
+        id = 0,
+        slot_name = "none"
+    }
+    create_logistics_event("TAKE", actor, source, item)
+    
+    -- 2. GIVE to player inventory
+    -- 2. GIVE ins Spieler-Inventar
+    local target = {
+        type = "player-inventory",
+        id = event.player_index,
+        slot_name = "main"
+    }
+    create_logistics_event("GIVE", actor, target, item)
+end)
+
+-- DEBUG: Test für Rechtsklick-Aufheben
+script.on_event(defines.events.on_player_cursor_stack_changed, function(event)
+    local player = game.players[event.player_index]
+    game.print("[DEBUG] on_player_cursor_stack_changed ausgelöst - Cursor hat jetzt: " .. (player.cursor_stack.valid_for_read and player.cursor_stack.name or "nichts"))
+end)
+
+-- Event: Player crafts item (manually)
+-- Event: Spieler craftet Item (manuell)
+-- Uses retrograde booking: TAKE ingredients -> MAKE -> GIVE result
+-- Nutzt retrograde Buchung: TAKE Zutaten -> MAKE -> GIVE Ergebnis
+script.on_event(defines.events.on_player_crafted_item, function(event)
+    local player = game.players[event.player_index]
+    local item_stack = event.item_stack
+    local recipe = event.recipe
+    
+    if not item_stack or not item_stack.valid_for_read or not recipe then return end
+    
+    init_player_data(event.player_index)
+    
+    local actor = {
+        type = "player-hand",
+        id = event.player_index,
+        name = player.name
+    }
+    
+    -- Crafting location (virtual)
+    -- Crafting-Ort (virtuell)
+    local crafting_location = {
+        type = "crafting",
+        id = event.player_index,
+        slot_name = recipe.name
+    }
+    
+    -- Player inventory as source/target
+    -- Spieler-Inventar als Quelle/Ziel
+    local player_inventory = {
+        type = "player-inventory",
+        id = event.player_index,
+        slot_name = "main"
+    }
+    
+    -- 1. RETROGRADE BOOKING: TAKE all ingredients from player inventory
+    -- 1. RETROGRADE BUCHUNG: TAKE alle Zutaten aus Spieler-Inventar
+    local ingredients = recipe.ingredients
+    for _, ingredient in pairs(ingredients) do
+        if ingredient.name then
+            local ingredient_item = {
+                name = ingredient.name,
+                quantity = ingredient.amount * item_stack.count, -- Multiply by crafted quantity
+                quality = "normal" -- Recipes don't specify quality, assume normal
+            }
+            
+            -- TAKE ingredient from player inventory
+            -- TAKE Zutat aus Spieler-Inventar
+            create_logistics_event("TAKE", actor, player_inventory, ingredient_item)
+            
+            -- GIVE ingredient to crafting
+            -- GIVE Zutat zum Crafting
+            create_logistics_event("GIVE", actor, crafting_location, ingredient_item)
+        end
+    end
+    
+    -- 2. MAKE: The actual crafting process
+    -- 2. MAKE: Der eigentliche Crafting-Vorgang
+    local crafted_item = {
+        name = item_stack.name,
+        quantity = item_stack.count,
+        quality = item_stack.quality and item_stack.quality.name or "normal"
+    }
+    
+    create_logistics_event("MAKE", actor, crafting_location, crafted_item)
+    
+    -- 3. TAKE: Remove crafted item from crafting
+    -- 3. TAKE: Gefertigtes Item aus dem Crafting nehmen
+    create_logistics_event("TAKE", actor, crafting_location, crafted_item)
+    
+    -- 4. GIVE: Put crafted item into player inventory
+    -- 4. GIVE: Gefertigtes Item ins Spieler-Inventar
+    create_logistics_event("GIVE", actor, player_inventory, crafted_item)
+end)
+
+-- Event: BEFORE player mines entity - capture inventory contents
+-- Event: BEVOR Spieler Entität abbaut - erfasse Inventar-Inhalte
+script.on_event(defines.events.on_pre_player_mined_item, function(event)
+    local player = game.players[event.player_index]
+    local entity = event.entity
+    
+    if not entity or not entity.valid then return end
+    
+    init_player_data(event.player_index)
+    
+    local actor = {
+        type = "player-hand",
+        id = event.player_index,
+        name = player.name
+    }
+    
+    -- Special case: Item on ground (Rechtsklick auf Item am Boden)
+    -- Spezialfall: Item am Boden (Rechtsklick auf Item am Boden)
+    if entity.type == "item-entity" and entity.stack and entity.stack.valid_for_read then
+        local item = {
+            name = entity.stack.name,
+            quantity = entity.stack.count,
+            quality = entity.stack.quality and entity.stack.quality.name or "normal"
+        }
+        
+        -- TAKE from ground
+        local source = {
+            type = "ground",
+            id = 0,
+            slot_name = "none"
+        }
+        create_logistics_event("TAKE", actor, source, item)
+        
+        -- GIVE to player inventory
+        local target = {
+            type = "player-inventory",
+            id = event.player_index,
+            slot_name = "main"
+        }
+        create_logistics_event("GIVE", actor, target, item)
+        
+        return -- Fertig für item-on-ground
+    end
+    
+    -- Normal case: Entity with inventories (Kisten, Maschinen, etc.)
+    -- Normalfall: Entity mit Inventaren (Kisten, Maschinen, etc.)
+    -- Get all inventories of this entity
+    -- Hole alle Inventare dieser Entity
+    local inventories = get_all_entity_inventories(entity)
+    
+    -- DEBUG: Zeige was gefunden wurde
+--    if #inventories > 0 then
+--        game.print("[DEBUG PRE-MINING] Entity: " .. entity.type .. " [ID:" .. (entity.unit_number or 0) .. "] - Found " .. #inventories .. " inventory slots")
+--    end
+    
+    for _, inv_data in pairs(inventories) do
+        if inv_data.inventory and inv_data.inventory.valid then
+            local contents = inv_data.inventory.get_contents()
+            
+            -- DEBUG: Zeige Slot-Info
+            local item_count = 0
+            for _ in pairs(contents) do item_count = item_count + 1 end
+--            game.print("[DEBUG PRE-MINING]   Slot: " .. inv_data.slot_name .. " - Items: " .. item_count)
+            
+            for _, item_data in pairs(contents) do
+                if type(item_data) == "table" and item_data.name then
+                    local item = {
+                        name = item_data.name,
+                        quantity = item_data.count,
+                        quality = item_data.quality or "normal"
+                    }
+                    
+--                    game.print("[DEBUG PRE-MINING]     -> TAKE " .. item.quantity .. "x " .. item.name .. " from slot:" .. inv_data.slot_name)
+                    
+                    -- TAKE from entity inventory (chest content, module slots, etc.)
+                    -- TAKE aus Entity-Inventar (Kisten-Inhalt, Modul-Slots, etc.)
+                    local source = {
+                        type = entity.type,
+                        id = entity.unit_number or 0,
+                        slot_name = inv_data.slot_name
+                    }
+                    create_logistics_event("TAKE", actor, source, item)
+                    
+                    -- GIVE to player inventory
+                    -- GIVE ins Spieler-Inventar
+                    local target = {
+                        type = "player-inventory",
+                        id = event.player_index,
+                        slot_name = "main"
+                    }
+                    create_logistics_event("GIVE", actor, target, item)
+                end
+            end
+        end
+    end
+end)
+
+-- Event: Player mines/deconstructs entity and gets items
+-- Event: Spieler baut Entität ab und bekommt Items
+script.on_event(defines.events.on_player_mined_entity, function(event)
+    local player = game.players[event.player_index]
+    local entity = event.entity
+    local buffer = event.buffer -- LuaInventory containing the mined items
+    
+    if not buffer or not buffer.valid then return end
+    
+    init_player_data(event.player_index)
+    
+    local actor = {
+        type = "player-hand",
+        id = event.player_index,
+        name = player.name
+    }
+    
+    -- Get all items from mining result
+    -- Hole alle Items aus dem Abbau-Ergebnis
+    local contents = buffer.get_contents()
+    
+    for _, item_data in pairs(contents) do
+        if type(item_data) == "table" and item_data.name then
+            local item = {
+                name = item_data.name,
+                quantity = item_data.count,
+                quality = item_data.quality or "normal"
+            }
+            
+            -- TAKE from mined entity
+            -- TAKE von abgebauter Entität
+            local source = {
+                type = entity.type,
+                id = entity.unit_number or 0,
+                slot_name = "mining"
+            }
+            create_logistics_event("TAKE", actor, source, item)
+            
+            -- GIVE to player inventory
+            -- GIVE ins Spieler-Inventar
+            local target = {
+                type = "player-inventory",
+                id = event.player_index,
+                slot_name = "main"
+            }
+            create_logistics_event("GIVE", actor, target, item)
+        end
+    end
 end)
