@@ -11,18 +11,40 @@
 -- {
 --  tick = 12345,
 --  actor = { type = "player-hand", id = 1, name = "PlayerName"},
+--  -- OR for robots:
+--  -- actor = { type = "logistic-robot", id = 67890, name = "construction-robot"},
 --  action = "GIVE",
 --  source_or_target = { type = "assembling-machine-2", id = 67890, slot_name = "modules"},
+--  -- OR for logistic network:
+--  -- source_or_target = { type = "logistic-network", id = 0, slot_name = "storage"},
 --  item = { name = "efficiency-module", quantity = 1, quality = "epic"}
 -- }
 --
 -- Actions: TAKE, GIVE, MAKE
 -- MAKE is used for crafting/production processes
 --
+-- Actor types: "player-hand", "logistic-robot"
+-- Source/Target types: entity types, "player-inventory", "ground", "logistic-network", "crafting"
+--
 -- Version 0.1.0 first operational Version
 -- Version 0.1.1 Make intriduced
 -- Version 0.2.0 Material in machines and chests is traced
---               taking material from the ground (F or left-click) corrected 
+--               taking material from the ground (F or left-click) corrected
+-- Version 0.3.0 Robot activities are now tracked
+--               TAKE events when robots remove items from entities
+--               Actor type "logistic-robot" for robot-initiated actions
+-- Version 0.3.1 Delta tracking for robots implemented
+--               Each robot reports only the actual quantity it took (4 items max)
+--               Prevents duplicate reporting when multiple robots work on same entity
+-- Version 0.4.0 Robot BUILD operations tracked (symmetric to mining)
+--               on_robot_built_entity: TAKE from logistic-network, GIVE to entity
+--               Detects when robots fill entity inventories (modules, materials)
+--               Upgrade operations now fully tracked (old entity removed, new entity placed)
+-- Version 0.4.1 Efficient monitoring approach for robot fills
+--               Entities added to monitoring list after build
+--               Periodic check (every 60 ticks = ~1 second) for inventory changes
+--               Works for modules placed at ANY time (even minutes later)
+--               Auto-cleanup after 10 minutes of no changes
 --
 -- ------------------------------------------
 
@@ -37,12 +59,16 @@ local logistics_event_id = script.generate_event_name()
 script.on_init(function()
     storage.player_data = {}
     storage.logistics_events = {}
+    storage.entity_snapshots = {} -- Snapshots for robot delta-tracking
+    storage.entities_to_monitor = {} -- Entities being monitored for robot fills
     game.print("[Big Brother] Initialisiert - Event-ID: " .. tostring(logistics_event_id))
 end)
 
 script.on_configuration_changed(function()
     storage.player_data = storage.player_data or {}
     storage.logistics_events = storage.logistics_events or {}
+    storage.entity_snapshots = storage.entity_snapshots or {}
+    storage.entities_to_monitor = storage.entities_to_monitor or {}
     game.print("[Big Brother] Konfiguration geändert - Event-ID: " .. tostring(logistics_event_id))
 end)
 
@@ -226,6 +252,54 @@ local function get_all_entity_inventories(entity)
     end
 
     return inventories
+end
+
+-- Helper function: Create complete entity snapshot (all inventories/slots)
+-- Hilfsfunktion: Erstelle kompletten Entity-Snapshot (alle Inventare/Slots)
+local function create_entity_snapshot(entity)
+    if not entity or not entity.valid then return {} end
+    
+    local snapshot = {}
+    local inventories = get_all_entity_inventories(entity)
+    
+    for _, inv_data in pairs(inventories) do
+        if inv_data.inventory and inv_data.inventory.valid then
+            local slot_name = inv_data.slot_name
+            snapshot[slot_name] = create_inventory_snapshot(inv_data.inventory)
+        end
+    end
+    
+    return snapshot
+end
+
+-- Helper function: Compare entity snapshots and get deltas per slot
+-- Hilfsfunktion: Vergleiche Entity-Snapshots und hole Deltas pro Slot
+local function compare_entity_snapshots(old_snap, new_snap)
+    local deltas = {} -- {slot_name = {item_key = delta_quantity}}
+    
+    -- Check all slots that existed before
+    for slot_name, old_items in pairs(old_snap) do
+        local new_items = new_snap[slot_name] or {}
+        local slot_changes = compare_snapshots(old_items, new_items)
+        
+        if next(slot_changes) then
+            deltas[slot_name] = slot_changes
+        end
+    end
+    
+    -- Check new slots that didn't exist before
+    for slot_name, new_items in pairs(new_snap) do
+        if not old_snap[slot_name] then
+            local empty_items = {}
+            local slot_changes = compare_snapshots(empty_items, new_items)
+            
+            if next(slot_changes) then
+                deltas[slot_name] = slot_changes
+            end
+        end
+    end
+    
+    return deltas
 end
 
 -- Initialize player data
@@ -671,7 +745,7 @@ script.on_event(defines.events.on_picked_up_item, function(event)
     
     if not item_stack or not item_stack.name then return end
     
-    game.print("[DEBUG] on_picked_up_item: " .. item_stack.name .. " x" .. item_stack.count)
+--    game.print("[DEBUG] on_picked_up_item: " .. item_stack.name .. " x" .. item_stack.count)
     
     init_player_data(event.player_index)
     
@@ -707,10 +781,10 @@ script.on_event(defines.events.on_picked_up_item, function(event)
 end)
 
 -- DEBUG: Test für Rechtsklick-Aufheben
-script.on_event(defines.events.on_player_cursor_stack_changed, function(event)
-    local player = game.players[event.player_index]
-    game.print("[DEBUG] on_player_cursor_stack_changed ausgelöst - Cursor hat jetzt: " .. (player.cursor_stack.valid_for_read and player.cursor_stack.name or "nichts"))
-end)
+--script.on_event(defines.events.on_player_cursor_stack_changed, function(event)
+--    local player = game.players[event.player_index]
+--    game.print("[DEBUG] on_player_cursor_stack_changed ausgelöst - Cursor hat jetzt: " .. (player.cursor_stack.valid_for_read and player.cursor_stack.name or "nichts"))
+--end)
 
 -- Event: Player crafts item (manually)
 -- Event: Spieler craftet Item (manuell)
@@ -930,6 +1004,315 @@ script.on_event(defines.events.on_player_mined_entity, function(event)
                 slot_name = "main"
             }
             create_logistics_event("GIVE", actor, target, item)
+        end
+    end
+end)
+
+-- ========================================
+-- ROBOT ACTIVITY TRACKING (WITH DELTA)
+-- ========================================
+
+-- Event: Entity marked for deconstruction - create initial snapshot
+-- Event: Entität zum Abbau markiert - erstelle initialen Snapshot
+script.on_event(defines.events.on_marked_for_deconstruction, function(event)
+    local entity = event.entity
+    
+    if not entity or not entity.valid then return end
+    
+    -- Create unique key for this entity
+    local entity_key = entity.unit_number or (entity.position.x .. "_" .. entity.position.y)
+    
+    -- Create initial snapshot when marked for deconstruction
+    -- Erstelle initialen Snapshot wenn zum Abbau markiert
+    storage.entity_snapshots[entity_key] = create_entity_snapshot(entity)
+end)
+
+-- Event: BEFORE robot mines entity - capture inventory contents and compare delta
+-- Event: BEVOR Roboter Entität abbaut - erfasse Inventar-Inhalte und vergleiche Delta
+script.on_event(defines.events.on_robot_pre_mined, function(event)
+    local entity = event.entity
+    local robot = event.robot
+    
+    if not entity or not entity.valid then return end
+    if not robot or not robot.valid then return end
+    
+    -- Create unique key for this entity
+    local entity_key = entity.unit_number or (entity.position.x .. "_" .. entity.position.y)
+    
+    local actor = {
+        type = "logistic-robot",
+        id = robot.unit_number or 0,
+        name = robot.name or "construction-robot"
+    }
+    
+    -- Special case: Item on ground
+    -- Spezialfall: Item am Boden
+    if entity.type == "item-entity" and entity.stack and entity.stack.valid_for_read then
+        local item = {
+            name = entity.stack.name,
+            quantity = entity.stack.count,
+            quality = entity.stack.quality and entity.stack.quality.name or "normal"
+        }
+        
+        -- TAKE from ground
+        local source = {
+            type = "ground",
+            id = 0,
+            slot_name = "none"
+        }
+        create_logistics_event("TAKE", actor, source, item)
+        
+        -- GIVE to logistic network
+        local target = {
+            type = "logistic-network",
+            id = 0,
+            slot_name = "storage"
+        }
+        create_logistics_event("GIVE", actor, target, item)
+        
+        return
+    end
+    
+    -- Normal case: Entity with inventories - USE DELTA TRACKING
+    -- Normalfall: Entity mit Inventaren - BENUTZE DELTA TRACKING
+    
+    -- Get OLD snapshot (if exists)
+    local old_snapshot = storage.entity_snapshots[entity_key] or {}
+    
+    -- Create NEW snapshot (current state)
+    local new_snapshot = create_entity_snapshot(entity)
+    
+    -- Calculate DELTA (what changed)
+    local deltas = compare_entity_snapshots(old_snapshot, new_snapshot)
+    
+    -- Process each slot's changes
+    for slot_name, slot_changes in pairs(deltas) do
+        for item_key, delta_quantity in pairs(slot_changes) do
+            if delta_quantity < 0 then
+                -- Negative delta means items were TAKEN
+                local item_name, quality = parse_item_key(item_key)
+                
+                local item = {
+                    name = item_name,
+                    quantity = math.abs(delta_quantity),
+                    quality = quality
+                }
+                
+                -- TAKE from entity inventory
+                local source = {
+                    type = entity.type,
+                    id = entity.unit_number or 0,
+                    slot_name = slot_name
+                }
+                create_logistics_event("TAKE", actor, source, item)
+                
+                -- GIVE to logistic network
+                local target = {
+                    type = "logistic-network",
+                    id = 0,
+                    slot_name = "storage"
+                }
+                create_logistics_event("GIVE", actor, target, item)
+            end
+        end
+    end
+    
+    -- SAVE new snapshot for next comparison
+    storage.entity_snapshots[entity_key] = new_snapshot
+end)
+
+-- Event: Robot mines/deconstructs entity and gets items
+-- Event: Roboter baut Entität ab und bekommt Items
+script.on_event(defines.events.on_robot_mined_entity, function(event)
+    local entity = event.entity
+    local robot = event.robot
+    local buffer = event.buffer -- LuaInventory containing the mined items
+    
+    if not buffer or not buffer.valid then return end
+    if not robot or not robot.valid then return end
+    
+    -- Clean up snapshot (entity no longer exists)
+    local entity_key = entity.unit_number or (entity.position.x .. "_" .. entity.position.y)
+    storage.entity_snapshots[entity_key] = nil
+    
+    local actor = {
+        type = "logistic-robot",
+        id = robot.unit_number or 0,
+        name = robot.name or "construction-robot"
+    }
+    
+    -- Get all items from mining result (the entity itself)
+    -- Hole alle Items aus dem Abbau-Ergebnis (die Entität selbst)
+    local contents = buffer.get_contents()
+    
+    for _, item_data in pairs(contents) do
+        if type(item_data) == "table" and item_data.name then
+            local item = {
+                name = item_data.name,
+                quantity = item_data.count,
+                quality = item_data.quality or "normal"
+            }
+            
+            -- TAKE from mined entity (the structure itself)
+            -- TAKE von abgebauter Entität (die Struktur selbst)
+            local source = {
+                type = entity.type,
+                id = entity.unit_number or 0,
+                slot_name = "mining"
+            }
+            create_logistics_event("TAKE", actor, source, item)
+            
+            -- GIVE to logistic network
+            -- GIVE ins Logistiknetzwerk
+            local target = {
+                type = "logistic-network",
+                id = 0,
+                slot_name = "storage"
+            }
+            create_logistics_event("GIVE", actor, target, item)
+        end
+    end
+end)
+
+-- Event: Robot builds entity (symmetric to mining)
+-- Event: Roboter baut Entität (symmetrisch zum Abbau)
+script.on_event(defines.events.on_robot_built_entity, function(event)
+    local entity = event.created_entity or event.entity
+    local robot = event.robot
+    local stack = event.stack -- The item used to build (e.g., assembling-machine-2)
+    
+    if not entity or not entity.valid then return end
+    if not robot or not robot.valid then return end
+    if not stack or not stack.valid_for_read then return end
+    
+    local actor = {
+        type = "logistic-robot",
+        id = robot.unit_number or 0,
+        name = robot.name or "construction-robot"
+    }
+    
+    -- The entity item itself
+    local item = {
+        name = stack.name,
+        quantity = stack.count,
+        quality = stack.quality and stack.quality.name or "normal"
+    }
+    
+    -- TAKE from logistic network
+    -- TAKE aus Logistiknetzwerk
+    local source = {
+        type = "logistic-network",
+        id = 0,
+        slot_name = "storage"
+    }
+    create_logistics_event("TAKE", actor, source, item)
+    
+    -- GIVE to world (place entity)
+    -- GIVE in die Welt (Entität platzieren)
+    local target = {
+        type = entity.type,
+        id = entity.unit_number or 0,
+        slot_name = "building"
+    }
+    create_logistics_event("GIVE", actor, target, item)
+    
+    -- Create initial snapshot EMPTY (entity just built, no contents yet)
+    -- Erstelle initialen Snapshot LEER (Entität gerade gebaut, noch kein Inhalt)
+    local entity_key = entity.unit_number or (entity.position.x .. "_" .. entity.position.y)
+    storage.entity_snapshots[entity_key] = {}
+    
+    -- Add to tracking list (will be monitored periodically)
+    -- Zur Tracking-Liste hinzufügen (wird periodisch überwacht)
+    if not storage.entities_to_monitor then
+        storage.entities_to_monitor = {}
+    end
+    storage.entities_to_monitor[entity_key] = {
+        entity = entity,
+        last_check = game.tick
+    }
+end)
+
+-- ========================================
+-- PERIODIC ENTITY MONITORING
+-- Monitors tracked entities for inventory changes by robots
+-- Much more efficient than scanning all entities
+-- ========================================
+
+-- Periodic check: Monitor tracked entities for inventory changes
+-- Periodische Prüfung: Überwache getrackte Entities für Inventar-Änderungen
+script.on_nth_tick(60, function(event)
+    -- Every 60 ticks = ~1 second at 60 FPS
+    -- Alle 60 ticks = ~1 Sekunde bei 60 FPS
+    
+    if not storage.entities_to_monitor then return end
+    if not storage.entity_snapshots then return end
+    
+    for entity_key, monitor_data in pairs(storage.entities_to_monitor) do
+        local entity = monitor_data.entity
+        
+        if entity and entity.valid then
+            local old_snapshot = storage.entity_snapshots[entity_key] or {}
+            local new_snapshot = create_entity_snapshot(entity)
+            local deltas = compare_entity_snapshots(old_snapshot, new_snapshot)
+            
+            -- Check for items added (positive deltas = robots filled it)
+            -- Prüfe für hinzugefügte Items (positive Deltas = Roboter haben gefüllt)
+            local has_changes = false
+            for slot_name, slot_changes in pairs(deltas) do
+                for item_key, delta_quantity in pairs(slot_changes) do
+                    if delta_quantity > 0 then
+                        has_changes = true
+                        local item_name, quality = parse_item_key(item_key)
+                        
+                        local item = {
+                            name = item_name,
+                            quantity = delta_quantity,
+                            quality = quality
+                        }
+                        
+                        local actor = {
+                            type = "logistic-robot",
+                            id = 0,
+                            name = "construction-robot"
+                        }
+                        
+                        -- TAKE from logistic network
+                        local source = {
+                            type = "logistic-network",
+                            id = 0,
+                            slot_name = "storage"
+                        }
+                        create_logistics_event("TAKE", actor, source, item)
+                        
+                        -- GIVE to entity inventory
+                        local target = {
+                            type = entity.type,
+                            id = entity.unit_number or 0,
+                            slot_name = slot_name
+                        }
+                        create_logistics_event("GIVE", actor, target, item)
+                    end
+                end
+            end
+            
+            -- Update snapshot
+            storage.entity_snapshots[entity_key] = new_snapshot
+            
+            -- If changes detected, reset the timer
+            -- Bei Änderungen Timer zurücksetzen
+            if has_changes then
+                monitor_data.last_check = game.tick
+            end
+            
+            -- Remove from monitoring if entity is stable for a while (no changes for 10 minutes)
+            -- Aus Monitoring entfernen wenn Entity stabil ist (keine Änderungen für 10 Minuten)
+            if game.tick - monitor_data.last_check > 36000 then -- 10 minutes at 60 FPS
+                storage.entities_to_monitor[entity_key] = nil
+            end
+        else
+            -- Entity no longer valid, remove from monitoring
+            -- Entity nicht mehr valide, aus Monitoring entfernen
+            storage.entities_to_monitor[entity_key] = nil
         end
     end
 end)
